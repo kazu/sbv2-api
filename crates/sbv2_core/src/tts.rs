@@ -316,27 +316,9 @@ impl TTSModelHolder {
                 if t.is_empty() {
                     continue;
                 }
-                let (bert_ori, phones, tones, lang_ids) = self.parse_text(t)?;
-
-                let vits2 = self
-                    .find_model(ident)?
-                    .vits2
-                    .as_mut()
-                    .ok_or(Error::ModelNotFoundError(ident.into().to_string()))?;
-                let audio = model::synthesize(
-                    vits2,
-                    bert_ori.to_owned(),
-                    phones,
-                    Array1::from_vec(vec![speaker_id]),
-                    tones,
-                    lang_ids,
-                    style_vector.clone(),
-                    options.sdp_ratio,
-                    options.length_scale,
-                    0.677,
-                    0.8,
-                )?;
-                audios.push(audio.clone());
+                let audio = self
+                    .synthesize_segment_with_fallback(ident, t, &style_vector, speaker_id, &options)?;
+                audios.push(audio);
                 if i != texts.len() - 1 {
                     audios.push(Array3::zeros((1, 1, 22050)));
                 }
@@ -346,28 +328,80 @@ impl TTSModelHolder {
                 &audios.iter().map(|x| x.view()).collect::<Vec<_>>(),
             )?
         } else {
-            let (bert_ori, phones, tones, lang_ids) = self.parse_text(text)?;
-
-            let vits2 = self
-                .find_model(ident)?
-                .vits2
-                .as_mut()
-                .ok_or(Error::ModelNotFoundError(ident.into().to_string()))?;
-            model::synthesize(
-                vits2,
-                bert_ori.to_owned(),
-                phones,
-                Array1::from_vec(vec![speaker_id]),
-                tones,
-                lang_ids,
-                style_vector,
-                options.sdp_ratio,
-                options.length_scale,
-                0.677,
-                0.8,
-            )?
+            self.synthesize_segment_with_fallback(ident, text, &style_vector, speaker_id, &options)?
         };
         tts_util::array_to_vec(audio_array)
+    }
+
+    /// Synthesize a single text into an audio array (no fallback / no `\n` splitting).
+    fn synthesize_one<I: Into<TTSIdent> + Copy>(
+        &mut self,
+        ident: I,
+        text: &str,
+        style_vector: &Array1<f32>,
+        speaker_id: i64,
+        options: &SynthesizeOptions,
+    ) -> Result<Array3<f32>> {
+        let (bert_ori, phones, tones, lang_ids) = self.parse_text(text)?;
+        let vits2 = self
+            .find_model(ident)?
+            .vits2
+            .as_mut()
+            .ok_or(Error::ModelNotFoundError(ident.into().to_string()))?;
+        model::synthesize(
+            vits2,
+            bert_ori.to_owned(),
+            phones,
+            Array1::from_vec(vec![speaker_id]),
+            tones,
+            lang_ids,
+            style_vector.clone(),
+            options.sdp_ratio,
+            options.length_scale,
+            0.677,
+            0.8,
+        )
+    }
+
+    /// Synthesize `text`, but if the frontend (jpreprocess) or the model fails on it
+    /// (e.g. jpreprocess `PartOfSpeechParseError` on words like `スペシャルゲスト`), split the
+    /// text roughly in half at a char boundary and recurse on each half, concatenating the
+    /// recovered audio with a small gap. Single unparseable units fall back to a short silence.
+    ///
+    /// This guarantees the request never fails on a single un-processable word (the whole
+    /// upstream design flaw: it errors instead of degrading). Quality of the split part degrades
+    /// (small gaps / choppier reading) but audio is always produced. Smooth reading of such words
+    /// is a separate concern (fix jpreprocess to assign a default POS).
+    fn synthesize_segment_with_fallback<I: Into<TTSIdent> + Copy>(
+        &mut self,
+        ident: I,
+        text: &str,
+        style_vector: &Array1<f32>,
+        speaker_id: i64,
+        options: &SynthesizeOptions,
+    ) -> Result<Array3<f32>> {
+        // Common path: try the whole segment first (best quality, single synthesis).
+        if let Ok(audio) = self.synthesize_one(ident, text, style_vector, speaker_id, options) {
+            return Ok(audio);
+        }
+        let chars: Vec<char> = text.chars().collect();
+        // Base case: cannot split further -> emit a short silence instead of failing.
+        if chars.len() <= 1 {
+            return Ok(Array3::zeros((1, 1, 2205)));
+        }
+        // Split in half at a char boundary and recover each side recursively.
+        let mid = chars.len() / 2;
+        let left: String = chars[..mid].iter().collect();
+        let right: String = chars[mid..].iter().collect();
+        let left_audio =
+            self.synthesize_segment_with_fallback(ident, &left, style_vector, speaker_id, options)?;
+        let right_audio =
+            self.synthesize_segment_with_fallback(ident, &right, style_vector, speaker_id, options)?;
+        let gap = Array3::<f32>::zeros((1, 1, 2205));
+        Ok(concatenate(
+            Axis(2),
+            &[left_audio.view(), gap.view(), right_audio.view()],
+        )?)
     }
 
     pub fn easy_synthesize_neo<I: Into<TTSIdent> + Copy>(
