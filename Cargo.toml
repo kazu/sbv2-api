@@ -23,3 +23,11 @@ strip = true
 opt-level = "z"
 lto = true
 codegen-units = 1
+
+# jpreprocess の空品詞/壊れた辞書エントリで g2p が 500 になる問題の修正。
+# core だけを fork(kazu/jpreprocess)に差し替える。jpreprocess / jpreprocess-naist-jdic
+# 等は crates.io のまま(= 辞書は crates.io の prebuilt を維持)で、patched core に対して
+# 再コンパイルされる。空/未知の品詞は 名詞,一般 へ、CType/CForm/Pronunciation は Default へ
+# フォールバックして合成を止めない。詳細は fork のコミット参照。
+[patch.crates-io]
+jpreprocess-core = { git = "https://github.com/kazu/jpreprocess", branch = "default-pos-fallback" }
