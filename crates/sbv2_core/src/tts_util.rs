@@ -180,12 +180,26 @@ pub fn array_to_vec(audio_array: Array3<f32>) -> Result<Vec<u8>> {
         .unwrap_or(false);
 
     let channels: u16 = if force_stereo { 2 } else { 1 };
+    // 16-bit int PCM: downstream consumers (pydub / general audio tools) misread 32-bit float WAV
+    // (sample_width=4 taken as int32) and get noise. Emit int16 which everything reads correctly.
     let spec = WavSpec {
         channels,
         sample_rate: 44100,
-        bits_per_sample: 32,
-        sample_format: SampleFormat::Float,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
     };
+    // Peak-normalize the utterance to 0.95 FS (model output is quiet, peak ~-19 dBFS). Peak-based
+    // (not fixed gain) so it never clips.
+    let mut peak = 0f32;
+    for i in 0..audio_array.shape()[0] {
+        for &s in audio_array.slice(s![i, 0, ..]).iter() {
+            let a = s.abs();
+            if a > peak {
+                peak = a;
+            }
+        }
+    }
+    let gain = if peak > 1e-6 { 0.95f32 / peak } else { 1.0 };
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(&mut cursor, spec)?;
     for i in 0..audio_array.shape()[0] {
@@ -193,12 +207,14 @@ pub fn array_to_vec(audio_array: Array3<f32>) -> Result<Vec<u8>> {
         if force_stereo {
             for sample in output {
                 // Write to Left and Right channels
-                writer.write_sample(sample)?;
-                writer.write_sample(sample)?;
+                let v = ((sample * gain).clamp(-1.0, 1.0) * 32767.0) as i16;
+                writer.write_sample(v)?;
+                writer.write_sample(v)?;
             }
         } else {
             for sample in output {
-                writer.write_sample(sample)?;
+                let v = ((sample * gain).clamp(-1.0, 1.0) * 32767.0) as i16;
+                writer.write_sample(v)?;
             }
         }
     }
