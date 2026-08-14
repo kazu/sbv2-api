@@ -1267,7 +1267,8 @@ dependencies = [
 [[package]]
 name = "jpreprocess-core"
 version = "0.13.2"
-source = "git+https://github.com/kazu/jpreprocess?branch=default-pos-fallback#c2935a9a2ca11fdbb993edec4f16977e373ba738"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "946d356486ff2cab183d2a65323f13ae3fd35e4467abfd3ad47cb0574f5a877b"
 dependencies = [
  "aho-corasick",
  "bincode",

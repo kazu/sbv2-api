@@ -24,10 +24,9 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 
-# jpreprocess の空品詞/壊れた辞書エントリで g2p が 500 になる問題の修正。
-# core だけを fork(kazu/jpreprocess)に差し替える。jpreprocess / jpreprocess-naist-jdic
-# 等は crates.io のまま(= 辞書は crates.io の prebuilt を維持)で、patched core に対して
-# 再コンパイルされる。空/未知の品詞は 名詞,一般 へ、CType/CForm/Pronunciation は Default へ
-# フォールバックして合成を止めない。詳細は fork のコミット参照。
-[patch.crates-io]
-jpreprocess-core = { git = "https://github.com/kazu/jpreprocess", branch = "default-pos-fallback" }
+# 注: 以前あった jpreprocess-core の [patch.crates-io] は撤回した。
+# あれは「空品詞で 500」を握りつぶす修正だったが、真因は jpreprocess のバグではなく、
+# HF 配布の user 辞書 all.bin が jpreprocess の lindera(1.4.1) と別バージョンの lindera で
+# 焼かれていて features が読めない(全部化ける)ことだった。握りつぶすと化けた読みを音にする。
+# 正しい直し = all.bin を lindera 1.4.1 で焼き直したものに差し替える(Dockerfile 参照)。
+# よって jpreprocess は stock(0.13.2)のまま使う。
