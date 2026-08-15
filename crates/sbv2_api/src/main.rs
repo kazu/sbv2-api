@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use sbv2_core::tts::{SynthesizeOptions, TTSModelHolder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
 use tokio::fs;
@@ -18,7 +18,10 @@ mod error;
 use crate::error::AppResult;
 
 #[derive(OpenApi)]
-#[openapi(paths(models, synthesize), components(schemas(SynthesizeRequest)))]
+#[openapi(
+    paths(models, synthesize, g2p),
+    components(schemas(SynthesizeRequest, G2pRequest, G2pToken, G2pLine))
+)]
 struct ApiDoc;
 
 #[utoipa::path(
@@ -101,6 +104,73 @@ async fn synthesize(
         )?
     };
     Ok(([(CONTENT_TYPE, "audio/wav")], buffer))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct G2pRequest {
+    /// Text to grapheme-to-phoneme. May contain `\n`; each line is g2p'd separately
+    /// (mirroring how synthesis splits on `\n`) so context-dependent readings are kept.
+    text: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct G2pToken {
+    /// Token surface as segmented by the jpreprocess frontend.
+    surface: String,
+    /// Katakana pronunciation (NJD `pron`) SBV2 actually speaks for this surface.
+    yomi: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct G2pLine {
+    /// The input line these tokens came from.
+    text: String,
+    /// Per-token `(surface, yomi)` in order. Empty if the frontend could not parse the line.
+    tokens: Vec<G2pToken>,
+}
+
+/// Return SBV2's own per-token reading of `text` (CPU-only frontend, no synthesis).
+///
+/// This exposes exactly the readings synthesis uses, so callers can diff them against a
+/// trusted source (author ruby / LLM) and correct only the words SBV2 misreads. It never
+/// runs the ONNX model, so it is far lighter than `/synthesize`.
+#[utoipa::path(
+    post,
+    path = "/g2p",
+    request_body = G2pRequest,
+    responses(
+        (status = 200, description = "Per-line, per-token surface/yomi (katakana)", body = Vec<G2pLine>)
+    )
+)]
+async fn g2p(
+    State(state): State<AppState>,
+    Json(G2pRequest { text }): Json<G2pRequest>,
+) -> AppResult<impl IntoResponse> {
+    let holder = state.tts_model.lock().await;
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        // Best-effort: a line the frontend rejects yields empty tokens rather than a 500,
+        // so one bad line never fails the whole (per-episode) request.
+        let tokens = match holder.jtalk.process_text(line) {
+            Ok(proc) => proc
+                .tokens()
+                .into_iter()
+                .map(|(surface, yomi)| G2pToken { surface, yomi })
+                .collect(),
+            Err(e) => {
+                log::debug!("g2p: skipping unparseable line {line:?}: {e}");
+                Vec::new()
+            }
+        };
+        lines.push(G2pLine {
+            text: line.to_string(),
+            tokens,
+        });
+    }
+    Ok(Json(lines))
 }
 
 #[derive(Clone)]
@@ -195,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
         .route("/synthesize", post(synthesize))
+        .route("/g2p", post(g2p))
         .route("/models", get(models))
         .with_state(AppState::new().await?)
         .merge(Scalar::with_url("/docs", ApiDoc::openapi()));

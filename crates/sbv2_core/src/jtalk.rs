@@ -515,6 +515,26 @@ impl JTalkProcess {
         (part_lists[0].clone(), part_lists[9].clone())
     }
 
+    /// Per-token `(surface, yomi)` pairs straight from the jpreprocess frontend.
+    ///
+    /// `yomi` is the katakana pronunciation (NJD field 9, `pron`) that synthesis
+    /// actually consumes, so this is exactly how SBV2 reads `text` (same code, same
+    /// naist-jdic, same all.bin). Field access is bounds-checked: a malformed/short
+    /// NJD line degrades to an empty yomi instead of panicking, because this feeds a
+    /// best-effort `/g2p` endpoint that must never crash. Used by the reading-diff
+    /// furigana correction (see kakuyomu-tts `doc/08`).
+    pub fn tokens(&self) -> Vec<(String, String)> {
+        self.parsed
+            .iter()
+            .map(|parts| {
+                let fields: Vec<&str> = parts.split(',').collect();
+                let surface = fields.first().copied().unwrap_or("").to_string();
+                let yomi = fields.get(9).copied().unwrap_or("").replace('’', "");
+                (surface, yomi)
+            })
+            .collect()
+    }
+
     fn g2phone_tone_wo_punct(&self) -> Result<Vec<(String, i32)>> {
         let prosodies = self.g2p_prosody()?;
 
@@ -617,5 +637,58 @@ impl JTalkProcess {
         }
 
         Ok(phones)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! g2p per-token reading tests. Run with naist-jdic only (no all.bin / no ort):
+    //!   cargo test -p sbv2_core --no-default-features tokens
+    use super::*;
+
+    fn tokens_of(text: &str) -> Vec<(String, String)> {
+        JTalk::new()
+            .expect("JTalk init")
+            .process_text(text)
+            .expect("process_text")
+            .tokens()
+    }
+
+    fn yomi_joined(text: &str) -> String {
+        tokens_of(text).iter().map(|(_, y)| y.clone()).collect()
+    }
+
+    #[test]
+    fn tokens_read_common_words_correctly() {
+        // This exact string is SBV2's real reading of the sentence and doubles as a
+        // normalization note for the reading-diff (doc/08 step C): `pron` (NJD field 9)
+        // writes long vowels as ー (not ウ/オ) and the topic particle は as ワ, so kana
+        // normalization must reconcile those against ruby/LLM readings before diffing.
+        assert_eq!(yomi_joined("今日はいい天気です"), "キョーワイイテンキデス");
+    }
+
+    #[test]
+    fn tokens_yield_nonempty_katakana_yomi() {
+        // Every non-punctuation token surface gets a non-empty yomi.
+        for (surface, yomi) in tokens_of("穂乃花さんが笑った") {
+            if surface.is_empty() || PUNCTUATIONS.contains(&surface.as_str()) {
+                continue;
+            }
+            assert!(!yomi.is_empty(), "empty yomi for surface {surface:?}");
+        }
+    }
+
+    #[test]
+    fn tokens_preserve_oov_name_surface() {
+        // 穂乃花 is an OOV proper noun the dictionary frontend cannot read as ホノカ
+        // (whisper round-trip heard ほ〜はな系). /g2p must still return the token(s)
+        // with the original surface preserved so alignment can locate the word, and a
+        // non-empty (if wrong) yomi that mirrors what SBV2 actually speaks — that
+        // mismatch is precisely what the ruby/LLM reading-diff corrects (doc/08).
+        let toks = tokens_of("穂乃花");
+        let surface: String = toks.iter().map(|(s, _)| s.clone()).collect();
+        assert_eq!(surface, "穂乃花", "surface not preserved: {toks:?}");
+        let yomi: String = toks.iter().map(|(_, y)| y.clone()).collect();
+        assert!(!yomi.is_empty(), "no yomi produced: {toks:?}");
     }
 }
