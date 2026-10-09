@@ -113,10 +113,7 @@ fn global_pool() -> bool {
                 .with_intra_threads(n)
                 .and_then(|p| p.with_inter_threads(n))
                 .expect("thread pool options");
-            ort::init()
-                .with_global_thread_pool(pool)
-                .commit()
-                .expect("ort environment");
+            ort::init().with_global_thread_pool(pool).commit();
         }
         on
     })
