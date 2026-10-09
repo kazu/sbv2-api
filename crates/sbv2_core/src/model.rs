@@ -12,19 +12,27 @@ pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> 
         .commit_from_memory(model_file.as_ref())?)
 }
 
-/// Same as `load_model`, also writing the optimized graph to `optimized` for `load_optimized_model`.
+/// Same as `load_model`, also writing the optimized graph to `optimized` and its prepacked
+/// weights to `<optimized>.data` for `load_optimized_model`.
 pub fn load_model_saving_optimized<P: AsRef<[u8]>>(
     model_file: P,
     bert: bool,
     optimized: &Path,
 ) -> Result<Session> {
+    let mut data = optimized.file_name().unwrap_or_default().to_os_string();
+    data.push(".data");
     Ok(session_builder(bert)?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_optimized_model_path(optimized)?
+        .with_config_entry(
+            "session.optimized_model_external_initializers_file_name",
+            data.to_string_lossy(),
+        )?
+        .with_config_entry("session.save_external_prepacked_constant_initializers", "1")?
         .commit_from_memory(model_file.as_ref())?)
 }
 
-/// Load a graph written by `load_model_saving_optimized` without optimizing it again.
+/// Load a graph written by `load_model_saving_optimized` without optimizing or prepacking it again.
 pub fn load_optimized_model(optimized: &Path, bert: bool) -> Result<Session> {
     Ok(session_builder(bert)?
         .with_optimization_level(GraphOptimizationLevel::Disable)?
