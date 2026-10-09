@@ -1,10 +1,12 @@
 use crate::error::Result;
 use ndarray::{array, Array1, Array2, Array3, Axis, Ix3};
+use memmap2::Mmap;
 use ort::session::{
     builder::{GraphOptimizationLevel, SessionBuilder},
     Session,
 };
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> {
     Ok(session_builder(bert)?
@@ -12,31 +14,112 @@ pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> 
         .commit_from_memory(model_file.as_ref())?)
 }
 
-/// Same as `load_model`, also writing the optimized graph to `optimized` and its prepacked
-/// weights to `<optimized>.data` for `load_optimized_model`.
+/// Same as `load_model`, also writing the optimized graph to `optimized` for
+/// `load_optimized_model`: a `.ort` path gets the ORT format, any other path gets ONNX
+/// with its prepacked weights in `<optimized>.data`.
 pub fn load_model_saving_optimized<P: AsRef<[u8]>>(
     model_file: P,
     bert: bool,
     optimized: &Path,
 ) -> Result<Session> {
-    let mut data = optimized.file_name().unwrap_or_default().to_os_string();
-    data.push(".data");
-    Ok(session_builder(bert)?
+    let mut builder = prepack_knob(session_builder(bert)?)?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_optimized_model_path(optimized)?
-        .with_config_entry(
-            "session.optimized_model_external_initializers_file_name",
-            data.to_string_lossy(),
-        )?
-        .with_config_entry("session.save_external_prepacked_constant_initializers", "1")?
-        .commit_from_memory(model_file.as_ref())?)
+        .with_optimized_model_path(optimized)?;
+    if !is_ort_format(optimized) {
+        let mut data = optimized.file_name().unwrap_or_default().to_os_string();
+        data.push(".data");
+        builder = builder
+            .with_config_entry(
+                "session.optimized_model_external_initializers_file_name",
+                data.to_string_lossy(),
+            )?
+            .with_config_entry("session.save_external_prepacked_constant_initializers", "1")?;
+    }
+    Ok(builder.commit_from_memory(model_file.as_ref())?)
 }
 
-/// Load a graph written by `load_model_saving_optimized` without optimizing or prepacking it again.
-pub fn load_optimized_model(optimized: &Path, bert: bool) -> Result<Session> {
-    Ok(session_builder(bert)?
-        .with_optimization_level(GraphOptimizationLevel::Disable)?
-        .commit_from_file(optimized)?)
+/// A voice session and the mapped file its graph may point into. The field order drops
+/// the session before the map.
+pub struct Vits2 {
+    pub session: Session,
+    _map: Option<Mmap>,
+}
+
+impl std::ops::Deref for Vits2 {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for Vits2 {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+}
+
+impl From<Session> for Vits2 {
+    fn from(session: Session) -> Self {
+        Vits2 {
+            session,
+            _map: None,
+        }
+    }
+}
+
+/// Load a graph written by `load_model_saving_optimized` without optimizing it again.
+/// A `.ort` file is mapped and used in place instead of being copied.
+pub fn load_optimized_model(optimized: &Path, bert: bool) -> Result<Vits2> {
+    let builder =
+        prepack_knob(session_builder(bert)?)?.with_optimization_level(GraphOptimizationLevel::Disable)?;
+    if is_ort_format(optimized) {
+        // SAFETY: load_model_saving_optimized is the only writer and only writes a path
+        // that does not exist yet.
+        let map = unsafe { Mmap::map(&std::fs::File::open(optimized)?)? };
+        let session = builder
+            .with_config_entry("session.use_ort_model_bytes_directly", "1")?
+            .with_config_entry("session.use_ort_model_bytes_for_initializers", "1")?
+            .commit_from_memory(&map)?;
+        Ok(Vits2 {
+            session,
+            _map: Some(map),
+        })
+    } else {
+        Ok(builder.commit_from_file(optimized)?.into())
+    }
+}
+
+fn is_ort_format(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "ort")
+}
+
+/// Experiment: SBV2_ORT_DISABLE_PREPACK leaves weights unpacked.
+fn prepack_knob(builder: SessionBuilder) -> Result<SessionBuilder> {
+    if std::env::var_os("SBV2_ORT_DISABLE_PREPACK").is_some() {
+        Ok(builder.with_config_entry("session.disable_prepacking", "1")?)
+    } else {
+        Ok(builder)
+    }
+}
+
+/// Experiment: SBV2_ORT_GLOBAL_POOL makes every session share one thread pool.
+fn global_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("SBV2_ORT_GLOBAL_POOL").is_some();
+        if on {
+            let n = num_cpus::get_physical();
+            let pool = ort::environment::GlobalThreadPoolOptions::default()
+                .with_intra_threads(n)
+                .and_then(|p| p.with_inter_threads(n))
+                .expect("thread pool options");
+            ort::init()
+                .with_global_thread_pool(pool)
+                .commit()
+                .expect("ort environment");
+        }
+        on
+    })
 }
 
 #[allow(clippy::vec_init_then_push, unused_variables)]
@@ -74,10 +157,14 @@ fn session_builder(bert: bool) -> Result<SessionBuilder> {
         exp.push(ort::execution_providers::CoreMLExecutionProvider::default().build());
     }
     exp.push(ort::execution_providers::CPUExecutionProvider::default().build());
-    Ok(Session::builder()?
+    let builder = Session::builder()?
         .with_execution_providers(exp)?
+        .with_parallel_execution(true)?;
+    if global_pool() {
+        return Ok(builder);
+    }
+    Ok(builder
         .with_intra_threads(num_cpus::get_physical())?
-        .with_parallel_execution(true)?
         .with_inter_threads(num_cpus::get_physical())?)
 }
 

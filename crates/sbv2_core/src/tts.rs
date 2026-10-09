@@ -31,7 +31,7 @@ where
 }
 
 pub struct TTSModel {
-    vits2: Option<Session>,
+    vits2: Option<model::Vits2>,
     style_vectors: Array2<f32>,
     ident: TTSIdent,
     source: Option<ModelSource>,
@@ -97,16 +97,22 @@ impl TTSModelHolder {
     }
 
     fn optimized_path(&self, ident: &TTSIdent) -> Option<PathBuf> {
+        // Experiment: SBV2_ORT_FORMAT=ort caches the ORT format instead of ONNX.
+        let ext = if std::env::var_os("SBV2_ORT_FORMAT").is_some() {
+            "ort"
+        } else {
+            "onnx"
+        };
         self.optimized_dir
             .as_ref()
-            .map(|d| d.join(format!("{ident}.onnx")))
+            .map(|d| d.join(format!("{ident}.{ext}")))
     }
 
-    fn build_vits2(&self, ident: &TTSIdent, vits2_bytes: &[u8]) -> Result<Session> {
+    fn build_vits2(&self, ident: &TTSIdent, vits2_bytes: &[u8]) -> Result<model::Vits2> {
         match self.optimized_path(ident) {
             Some(p) if p.exists() => model::load_optimized_model(&p, false),
-            Some(p) => model::load_model_saving_optimized(vits2_bytes, false, &p),
-            None => model::load_model(vits2_bytes, false),
+            Some(p) => Ok(model::load_model_saving_optimized(vits2_bytes, false, &p)?.into()),
+            None => Ok(model::load_model(vits2_bytes, false)?.into()),
         }
     }
 
