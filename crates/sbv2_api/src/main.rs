@@ -187,6 +187,10 @@ impl AppState {
                 .ok()
                 .and_then(|x| x.parse().ok()),
         )?;
+        if let Ok(dir) = env::var("SBV2_OPTIMIZED_DIR") {
+            fs::create_dir_all(&dir).await?;
+            tts_model.set_optimized_dir(dir);
+        }
         let models = env::var("MODELS_PATH").unwrap_or("models".to_string());
         let mut f = fs::read_dir(&models).await?;
         let mut entries = vec![];
@@ -203,28 +207,18 @@ impl AppState {
             } else if name.ends_with(".sbv2") {
                 let entry = &name[..name.len() - 5];
                 log::info!("Try loading: {entry}");
-                let sbv2_bytes = match fs::read(format!("{models}/{entry}.sbv2")).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        log::warn!("Error loading sbv2_bytes from file {entry}: {e}");
-                        continue;
-                    }
-                };
-                if let Err(e) = tts_model.load_sbv2file(entry, sbv2_bytes) {
+                if let Err(e) =
+                    tts_model.load_sbv2file_path(entry, format!("{models}/{entry}.sbv2"))
+                {
                     log::warn!("Error loading {entry}: {e}");
                 };
                 log::info!("Loaded: {entry}");
             } else if name.ends_with(".aivmx") {
                 let entry = &name[..name.len() - 6];
                 log::info!("Try loading: {entry}");
-                let aivmx_bytes = match fs::read(format!("{models}/{entry}.aivmx")).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        log::warn!("Error loading aivmx bytes from file {entry}: {e}");
-                        continue;
-                    }
-                };
-                if let Err(e) = tts_model.load_aivmx(entry, aivmx_bytes) {
+                if let Err(e) =
+                    tts_model.load_aivmx_path(entry, format!("{models}/{entry}.aivmx"))
+                {
                     log::error!("Error loading {entry}: {e}");
                 }
                 log::info!("Loaded: {entry}");

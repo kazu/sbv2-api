@@ -1,9 +1,89 @@
 use crate::error::Result;
 use ndarray::{array, Array1, Array2, Array3, Axis, Ix3};
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use memmap2::Mmap;
+use ort::session::{
+    builder::{GraphOptimizationLevel, SessionBuilder},
+    Session,
+};
+use std::path::Path;
+
+pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> {
+    Ok(session_builder(bert)?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .commit_from_memory(model_file.as_ref())?)
+}
+
+/// Same as `load_model` for a voice, also writing the optimized graph in ORT format to
+/// `optimized` (a `.ort` path) for `load_optimized_model`. The graph is specific to this
+/// machine. Weights stay unpacked so a later load can use the file in place.
+pub fn load_model_saving_optimized<P: AsRef<[u8]>>(
+    model_file: P,
+    optimized: &Path,
+) -> Result<Session> {
+    Ok(session_builder(false)?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_optimized_model_path(optimized)?
+        .with_config_entry("session.disable_prepacking", "1")?
+        .commit_from_memory(model_file.as_ref())?)
+}
+
+/// A voice session and the mapped file its graph may point into. The field order drops
+/// the session before the map.
+pub struct Vits2 {
+    pub session: Session,
+    _map: Option<Mmap>,
+}
+
+impl std::ops::Deref for Vits2 {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for Vits2 {
+    fn deref_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+}
+
+impl From<Session> for Vits2 {
+    fn from(session: Session) -> Self {
+        Vits2 {
+            session,
+            _map: None,
+        }
+    }
+}
+
+/// Load a voice graph written by `load_model_saving_optimized`. The file is mapped and
+/// used in place: no graph optimization, prepacking or copy of the weights, so the only
+/// memory the session owns is its working set.
+pub fn load_optimized_model(optimized: &Path) -> Result<Vits2> {
+    // SAFETY: load_model_saving_optimized is the only writer and only writes a path
+    // that does not exist yet.
+    let t0 = std::time::Instant::now();
+    let map = unsafe {
+        memmap2::MmapOptions::new()
+            .populate()
+            .map(&std::fs::File::open(optimized)?)?
+    };
+    let t1 = std::time::Instant::now();
+    let session = session_builder(false)?
+        .with_optimization_level(GraphOptimizationLevel::Disable)?
+        .with_config_entry("session.disable_prepacking", "1")?
+        .with_config_entry("session.use_ort_model_bytes_directly", "1")?
+        .with_config_entry("session.use_ort_model_bytes_for_initializers", "1")?
+        .commit_from_memory(&map)?;
+    log::debug!("timing map={:?} session={:?}", t1 - t0, t1.elapsed());
+    Ok(Vits2 {
+        session,
+        _map: Some(map),
+    })
+}
 
 #[allow(clippy::vec_init_then_push, unused_variables)]
-pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> {
+fn session_builder(bert: bool) -> Result<SessionBuilder> {
     let mut exp = Vec::new();
     #[cfg(feature = "tensorrt")]
     {
@@ -39,11 +119,9 @@ pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> 
     exp.push(ort::execution_providers::CPUExecutionProvider::default().build());
     Ok(Session::builder()?
         .with_execution_providers(exp)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_intra_threads(num_cpus::get_physical())?
         .with_parallel_execution(true)?
-        .with_inter_threads(num_cpus::get_physical())?
-        .commit_from_memory(model_file.as_ref())?)
+        .with_inter_threads(num_cpus::get_physical())?)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -8,6 +8,7 @@ use ndarray::{concatenate, Array1, Array2, Array3, Axis};
 use ort::session::Session;
 #[cfg(feature = "aivmx")]
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
 #[derive(PartialEq, Eq, Clone)]
@@ -30,10 +31,27 @@ where
 }
 
 pub struct TTSModel {
-    vits2: Option<Session>,
+    vits2: Option<model::Vits2>,
     style_vectors: Array2<f32>,
     ident: TTSIdent,
-    bytes: Option<Vec<u8>>,
+    source: Option<ModelSource>,
+}
+
+/// Where an unloaded model's vits2 onnx is rebuilt from
+enum ModelSource {
+    Bytes(Vec<u8>),
+    OnnxFile(PathBuf),
+    Sbv2File(PathBuf),
+}
+
+impl ModelSource {
+    fn read(&self) -> Result<Vec<u8>> {
+        match self {
+            ModelSource::Bytes(b) => Ok(b.clone()),
+            ModelSource::OnnxFile(p) => Ok(std::fs::read(p)?),
+            ModelSource::Sbv2File(p) => Ok(crate::sbv2file::parse_sbv2file(std::fs::read(p)?)?.1),
+        }
+    }
 }
 
 /// High-level Style-Bert-VITS2's API
@@ -43,6 +61,7 @@ pub struct TTSModelHolder {
     models: Vec<TTSModel>,
     pub jtalk: jtalk::JTalk,
     max_loaded_models: Option<usize>,
+    optimized_dir: Option<PathBuf>,
 }
 
 impl TTSModelHolder {
@@ -67,7 +86,28 @@ impl TTSModelHolder {
             jtalk,
             tokenizer,
             max_loaded_models,
+            optimized_dir: None,
         })
+    }
+
+    /// Write each voice's optimized graph to `dir` (once, in ORT format) and build evicted
+    /// voices from it by mapping the file in place. The graph is specific to this machine.
+    pub fn set_optimized_dir<D: Into<PathBuf>>(&mut self, dir: D) {
+        self.optimized_dir = Some(dir.into());
+    }
+
+    fn optimized_path(&self, ident: &TTSIdent) -> Option<PathBuf> {
+        self.optimized_dir
+            .as_ref()
+            .map(|d| d.join(format!("{ident}.ort")))
+    }
+
+    fn build_vits2(&self, ident: &TTSIdent, vits2_bytes: &[u8]) -> Result<model::Vits2> {
+        match self.optimized_path(ident) {
+            Some(p) if p.exists() => model::load_optimized_model(&p),
+            Some(p) => Ok(model::load_model_saving_optimized(vits2_bytes, &p)?.into()),
+            None => Ok(model::load_model(vits2_bytes, false)?.into()),
+        }
     }
 
     /// Return a list of model names
@@ -81,6 +121,33 @@ impl TTSModelHolder {
         ident: I,
         aivmx_bytes: P,
     ) -> Result<()> {
+        self.load_aivmx_with(ident, &aivmx_bytes, || {
+            ModelSource::Bytes(aivmx_bytes.as_ref().to_vec())
+        })
+    }
+
+    /// Load a .aivmx file; an evicted session is rebuilt by reading the file again
+    /// instead of keeping its bytes in memory.
+    #[cfg(feature = "aivmx")]
+    pub fn load_aivmx_path<I: Into<TTSIdent>, F: AsRef<Path>>(
+        &mut self,
+        ident: I,
+        path: F,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let aivmx_bytes = std::fs::read(path)?;
+        self.load_aivmx_with(ident, &aivmx_bytes, || {
+            ModelSource::OnnxFile(path.to_path_buf())
+        })
+    }
+
+    #[cfg(feature = "aivmx")]
+    fn load_aivmx_with<I: Into<TTSIdent>, P: AsRef<[u8]>>(
+        &mut self,
+        ident: I,
+        aivmx_bytes: P,
+        source: impl FnOnce() -> ModelSource,
+    ) -> Result<()> {
         let ident = ident.into();
         if self.find_model(ident.clone()).is_err() {
             let mut load = true;
@@ -89,7 +156,7 @@ impl TTSModelHolder {
                     load = false;
                 }
             }
-            let model = model::load_model(&aivmx_bytes, false)?;
+            let model = self.build_vits2(&ident, aivmx_bytes.as_ref())?;
             let metadata = model.metadata()?;
             if let Some(aivm_style_vectors) = metadata.custom("aivm_style_vectors") {
                 let aivm_style_vectors = BASE64_STANDARD.decode(aivm_style_vectors)?;
@@ -109,8 +176,8 @@ impl TTSModelHolder {
                 drop(metadata);
                 self.models.push(TTSModel {
                     vits2: if load { Some(model) } else { None },
-                    bytes: if self.max_loaded_models.is_some() {
-                        Some(aivmx_bytes.as_ref().to_vec())
+                    source: if self.max_loaded_models.is_some() {
+                        Some(source())
                     } else {
                         None
                     },
@@ -139,6 +206,21 @@ impl TTSModelHolder {
         Ok(())
     }
 
+    /// Load a .sbv2 file; an evicted session is rebuilt by reading the file again
+    /// instead of keeping its bytes in memory.
+    pub fn load_sbv2file_path<I: Into<TTSIdent>, F: AsRef<Path>>(
+        &mut self,
+        ident: I,
+        path: F,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let (style_vectors, vits2) =
+            crate::sbv2file::parse_sbv2file(std::fs::read(path)?)?;
+        self.load_with(ident, style_vectors, vits2, || {
+            ModelSource::Sbv2File(path.to_path_buf())
+        })
+    }
+
     /// Load a style vector and onnx model binary
     ///
     /// # Examples
@@ -152,6 +234,18 @@ impl TTSModelHolder {
         style_vectors_bytes: P,
         vits2_bytes: P,
     ) -> Result<()> {
+        self.load_with(ident, style_vectors_bytes, &vits2_bytes, || {
+            ModelSource::Bytes(vits2_bytes.as_ref().to_vec())
+        })
+    }
+
+    fn load_with<I: Into<TTSIdent>, P: AsRef<[u8]>, Q: AsRef<[u8]>>(
+        &mut self,
+        ident: I,
+        style_vectors_bytes: P,
+        vits2_bytes: Q,
+        source: impl FnOnce() -> ModelSource,
+    ) -> Result<()> {
         let ident = ident.into();
         if self.find_model(ident.clone()).is_err() {
             let mut load = true;
@@ -162,14 +256,14 @@ impl TTSModelHolder {
             }
             self.models.push(TTSModel {
                 vits2: if load {
-                    Some(model::load_model(&vits2_bytes, false)?)
+                    Some(self.build_vits2(&ident, vits2_bytes.as_ref())?)
                 } else {
                     None
                 },
                 style_vectors: style::load_style(style_vectors_bytes)?,
                 ident,
-                bytes: if self.max_loaded_models.is_some() {
-                    Some(vits2_bytes.as_ref().to_vec())
+                source: if self.max_loaded_models.is_some() {
+                    Some(source())
                 } else {
                     None
                 },
@@ -252,11 +346,15 @@ impl TTSModelHolder {
             return Ok(true);
         }
 
-        // Get bytes to build a Session
-        let bytes = self.models[target_index]
-            .bytes
-            .clone()
-            .ok_or(Error::ModelNotFoundError(ident.to_string()))?;
+        // Get the optimized graph, or bytes to build a Session
+        let input = match self.optimized_path(&ident).filter(|p| p.exists()) {
+            Some(p) => Ok(p),
+            None => Err(self.models[target_index]
+                .source
+                .as_ref()
+                .ok_or(Error::ModelNotFoundError(ident.to_string()))?
+                .read()?),
+        };
 
         // Enforce max loaded models by evicting a different loaded model's session, not removing the entry
         if let Some(max) = self.max_loaded_models {
@@ -274,7 +372,10 @@ impl TTSModelHolder {
         }
 
         // Build and set session in-place for the target model
-        let s = model::load_model(&bytes, false)?;
+        let s = match input {
+            Ok(p) => model::load_optimized_model(&p)?,
+            Err(bytes) => self.build_vits2(&ident, &bytes)?,
+        };
         self.models[target_index].vits2 = Some(s);
         Ok(true)
     }
@@ -300,6 +401,41 @@ impl TTSModelHolder {
     /// let audio = tts_holder.easy_synthesize("tsukuyomi", "こんにちは", 0, SynthesizeOptions::default())?;
     /// ```
     pub fn easy_synthesize<I: Into<TTSIdent> + Copy>(
+        &mut self,
+        ident: I,
+        text: &str,
+        style_id: i32,
+        speaker_id: i64,
+        options: SynthesizeOptions,
+    ) -> Result<Vec<u8>> {
+        let t0 = std::time::Instant::now();
+        let loaded = self.find_and_load_model(ident);
+        let t1 = std::time::Instant::now();
+        let result = loaded
+            .and_then(|_| self.easy_synthesize_loaded(ident, text, style_id, speaker_id, options));
+        let t2 = std::time::Instant::now();
+        self.release_unretained();
+        log::debug!(
+            "timing load={:?} synth={:?} release={:?}",
+            t1 - t0,
+            t2 - t1,
+            t2.elapsed()
+        );
+        result
+    }
+
+    /// With `max_loaded_models` of 0, drop the sessions built for a call once it returns.
+    /// The drop runs on its own thread so the caller does not wait for it.
+    fn release_unretained(&mut self) {
+        if self.max_loaded_models == Some(0) {
+            let sessions: Vec<_> = self.models.iter_mut().filter_map(|m| m.vits2.take()).collect();
+            if !sessions.is_empty() {
+                std::thread::spawn(move || drop(sessions));
+            }
+        }
+    }
+
+    fn easy_synthesize_loaded<I: Into<TTSIdent> + Copy>(
         &mut self,
         ident: I,
         text: &str,
@@ -405,6 +541,21 @@ impl TTSModelHolder {
     }
 
     pub fn easy_synthesize_neo<I: Into<TTSIdent> + Copy>(
+        &mut self,
+        ident: I,
+        text: &str,
+        given_tones: Option<Vec<i32>>,
+        style_id: i32,
+        speaker_id: i64,
+        options: SynthesizeOptions,
+    ) -> Result<Vec<u8>> {
+        let result =
+            self.easy_synthesize_neo_loaded(ident, text, given_tones, style_id, speaker_id, options);
+        self.release_unretained();
+        result
+    }
+
+    fn easy_synthesize_neo_loaded<I: Into<TTSIdent> + Copy>(
         &mut self,
         ident: I,
         text: &str,
