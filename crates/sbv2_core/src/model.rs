@@ -20,11 +20,17 @@ pub fn load_model_saving_optimized<P: AsRef<[u8]>>(
     model_file: P,
     optimized: &Path,
 ) -> Result<Session> {
-    Ok(session_builder(false)?
+    // Written under a temporary name and renamed, so a crash mid-write leaves no partial
+    // file at `optimized` for later loads to trust.
+    let tmp = optimized.with_extension("tmp");
+    let session = session_builder(false)?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_optimized_model_path(optimized)?
+        .with_optimized_model_path(&tmp)?
+        .with_config_entry("session.save_model_format", "ORT")?
         .with_config_entry("session.disable_prepacking", "1")?
-        .commit_from_memory(model_file.as_ref())?)
+        .commit_from_memory(model_file.as_ref())?;
+    std::fs::rename(&tmp, optimized)?;
+    Ok(session)
 }
 
 /// A voice session and the mapped file its graph may point into. The field order drops
