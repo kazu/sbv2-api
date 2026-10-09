@@ -407,6 +407,28 @@ impl TTSModelHolder {
         speaker_id: i64,
         options: SynthesizeOptions,
     ) -> Result<Vec<u8>> {
+        let result = self.easy_synthesize_loaded(ident, text, style_id, speaker_id, options);
+        self.release_unretained();
+        result
+    }
+
+    /// With `max_loaded_models` of 0, drop the sessions built for a call once it returns.
+    fn release_unretained(&mut self) {
+        if self.max_loaded_models == Some(0) {
+            for m in &mut self.models {
+                m.vits2 = None;
+            }
+        }
+    }
+
+    fn easy_synthesize_loaded<I: Into<TTSIdent> + Copy>(
+        &mut self,
+        ident: I,
+        text: &str,
+        style_id: i32,
+        speaker_id: i64,
+        options: SynthesizeOptions,
+    ) -> Result<Vec<u8>> {
         self.find_and_load_model(ident)?;
         let style_vector = self.get_style_vector(ident, style_id, options.style_weight)?;
         let audio_array = if options.split_sentences {
@@ -505,6 +527,21 @@ impl TTSModelHolder {
     }
 
     pub fn easy_synthesize_neo<I: Into<TTSIdent> + Copy>(
+        &mut self,
+        ident: I,
+        text: &str,
+        given_tones: Option<Vec<i32>>,
+        style_id: i32,
+        speaker_id: i64,
+        options: SynthesizeOptions,
+    ) -> Result<Vec<u8>> {
+        let result =
+            self.easy_synthesize_neo_loaded(ident, text, given_tones, style_id, speaker_id, options);
+        self.release_unretained();
+        result
+    }
+
+    fn easy_synthesize_neo_loaded<I: Into<TTSIdent> + Copy>(
         &mut self,
         ident: I,
         text: &str,
