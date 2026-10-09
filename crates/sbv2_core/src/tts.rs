@@ -8,6 +8,7 @@ use ndarray::{concatenate, Array1, Array2, Array3, Axis};
 use ort::session::Session;
 #[cfg(feature = "aivmx")]
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
 #[derive(PartialEq, Eq, Clone)]
@@ -39,12 +40,16 @@ pub struct TTSModel {
 /// Where an unloaded model's vits2 onnx is rebuilt from
 enum ModelSource {
     Bytes(Vec<u8>),
+    OnnxFile(PathBuf),
+    Sbv2File(PathBuf),
 }
 
 impl ModelSource {
     fn read(&self) -> Result<Vec<u8>> {
         match self {
             ModelSource::Bytes(b) => Ok(b.clone()),
+            ModelSource::OnnxFile(p) => Ok(std::fs::read(p)?),
+            ModelSource::Sbv2File(p) => Ok(crate::sbv2file::parse_sbv2file(std::fs::read(p)?)?.1),
         }
     }
 }
@@ -96,6 +101,21 @@ impl TTSModelHolder {
     ) -> Result<()> {
         self.load_aivmx_with(ident, &aivmx_bytes, || {
             ModelSource::Bytes(aivmx_bytes.as_ref().to_vec())
+        })
+    }
+
+    /// Load a .aivmx file; an evicted session is rebuilt by reading the file again
+    /// instead of keeping its bytes in memory.
+    #[cfg(feature = "aivmx")]
+    pub fn load_aivmx_path<I: Into<TTSIdent>, F: AsRef<Path>>(
+        &mut self,
+        ident: I,
+        path: F,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let aivmx_bytes = std::fs::read(path)?;
+        self.load_aivmx_with(ident, &aivmx_bytes, || {
+            ModelSource::OnnxFile(path.to_path_buf())
         })
     }
 
@@ -162,6 +182,21 @@ impl TTSModelHolder {
         let (style_vectors, vits2) = crate::sbv2file::parse_sbv2file(sbv2_bytes)?;
         self.load(ident, style_vectors, vits2)?;
         Ok(())
+    }
+
+    /// Load a .sbv2 file; an evicted session is rebuilt by reading the file again
+    /// instead of keeping its bytes in memory.
+    pub fn load_sbv2file_path<I: Into<TTSIdent>, F: AsRef<Path>>(
+        &mut self,
+        ident: I,
+        path: F,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let (style_vectors, vits2) =
+            crate::sbv2file::parse_sbv2file(std::fs::read(path)?)?;
+        self.load_with(ident, style_vectors, vits2, || {
+            ModelSource::Sbv2File(path.to_path_buf())
+        })
     }
 
     /// Load a style vector and onnx model binary
