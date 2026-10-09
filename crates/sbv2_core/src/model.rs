@@ -75,11 +75,18 @@ pub fn load_optimized_model(optimized: &Path, bert: bool) -> Result<Vits2> {
     if is_ort_format(optimized) {
         // SAFETY: load_model_saving_optimized is the only writer and only writes a path
         // that does not exist yet.
-        let map = unsafe { Mmap::map(&std::fs::File::open(optimized)?)? };
+        let t0 = std::time::Instant::now();
+        let map = unsafe {
+            memmap2::MmapOptions::new()
+                .populate()
+                .map(&std::fs::File::open(optimized)?)?
+        };
+        let t1 = std::time::Instant::now();
         let session = builder
             .with_config_entry("session.use_ort_model_bytes_directly", "1")?
             .with_config_entry("session.use_ort_model_bytes_for_initializers", "1")?
             .commit_from_memory(&map)?;
+        log::debug!("timing map={:?} session={:?}", t1 - t0, t1.elapsed());
         Ok(Vits2 {
             session,
             _map: Some(map),
