@@ -29,6 +29,8 @@ pub fn load_model_saving_optimized<P: AsRef<[u8]>>(
         .with_config_entry("session.save_model_format", "ORT")?
         .with_config_entry("session.disable_prepacking", "1")?
         .commit_from_memory(model_file.as_ref())?;
+    // ORT only checks the stream right after writing; this surfaces a failed flush (ENOSPC).
+    std::fs::File::open(&tmp)?.sync_all()?;
     std::fs::rename(&tmp, optimized)?;
     Ok(session)
 }
