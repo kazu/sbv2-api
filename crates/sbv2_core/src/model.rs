@@ -1,9 +1,18 @@
 use crate::error::Result;
 use ndarray::{array, Array1, Array2, Array3, Axis, Ix3};
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{
+    builder::{GraphOptimizationLevel, SessionBuilder},
+    Session,
+};
+
+pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> {
+    Ok(session_builder(bert)?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .commit_from_memory(model_file.as_ref())?)
+}
 
 #[allow(clippy::vec_init_then_push, unused_variables)]
-pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> {
+fn session_builder(bert: bool) -> Result<SessionBuilder> {
     let mut exp = Vec::new();
     #[cfg(feature = "tensorrt")]
     {
@@ -39,11 +48,9 @@ pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> 
     exp.push(ort::execution_providers::CPUExecutionProvider::default().build());
     Ok(Session::builder()?
         .with_execution_providers(exp)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_intra_threads(num_cpus::get_physical())?
         .with_parallel_execution(true)?
-        .with_inter_threads(num_cpus::get_physical())?
-        .commit_from_memory(model_file.as_ref())?)
+        .with_inter_threads(num_cpus::get_physical())?)
 }
 
 #[allow(clippy::too_many_arguments)]
