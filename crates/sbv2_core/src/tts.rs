@@ -104,6 +104,7 @@ impl TTSModelHolder {
 
     fn build_vits2(&self, ident: &TTSIdent, vits2_bytes: &[u8]) -> Result<Session> {
         match self.optimized_path(ident) {
+            Some(p) if p.exists() => model::load_optimized_model(&p, false),
             Some(p) => model::load_model_saving_optimized(vits2_bytes, false, &p),
             None => model::load_model(vits2_bytes, false),
         }
