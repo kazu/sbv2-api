@@ -33,7 +33,20 @@ pub struct TTSModel {
     vits2: Option<Session>,
     style_vectors: Array2<f32>,
     ident: TTSIdent,
-    bytes: Option<Vec<u8>>,
+    source: Option<ModelSource>,
+}
+
+/// Where an unloaded model's vits2 onnx is rebuilt from
+enum ModelSource {
+    Bytes(Vec<u8>),
+}
+
+impl ModelSource {
+    fn read(&self) -> Result<Vec<u8>> {
+        match self {
+            ModelSource::Bytes(b) => Ok(b.clone()),
+        }
+    }
 }
 
 /// High-level Style-Bert-VITS2's API
@@ -81,6 +94,18 @@ impl TTSModelHolder {
         ident: I,
         aivmx_bytes: P,
     ) -> Result<()> {
+        self.load_aivmx_with(ident, &aivmx_bytes, || {
+            ModelSource::Bytes(aivmx_bytes.as_ref().to_vec())
+        })
+    }
+
+    #[cfg(feature = "aivmx")]
+    fn load_aivmx_with<I: Into<TTSIdent>, P: AsRef<[u8]>>(
+        &mut self,
+        ident: I,
+        aivmx_bytes: P,
+        source: impl FnOnce() -> ModelSource,
+    ) -> Result<()> {
         let ident = ident.into();
         if self.find_model(ident.clone()).is_err() {
             let mut load = true;
@@ -109,8 +134,8 @@ impl TTSModelHolder {
                 drop(metadata);
                 self.models.push(TTSModel {
                     vits2: if load { Some(model) } else { None },
-                    bytes: if self.max_loaded_models.is_some() {
-                        Some(aivmx_bytes.as_ref().to_vec())
+                    source: if self.max_loaded_models.is_some() {
+                        Some(source())
                     } else {
                         None
                     },
@@ -152,6 +177,18 @@ impl TTSModelHolder {
         style_vectors_bytes: P,
         vits2_bytes: P,
     ) -> Result<()> {
+        self.load_with(ident, style_vectors_bytes, &vits2_bytes, || {
+            ModelSource::Bytes(vits2_bytes.as_ref().to_vec())
+        })
+    }
+
+    fn load_with<I: Into<TTSIdent>, P: AsRef<[u8]>, Q: AsRef<[u8]>>(
+        &mut self,
+        ident: I,
+        style_vectors_bytes: P,
+        vits2_bytes: Q,
+        source: impl FnOnce() -> ModelSource,
+    ) -> Result<()> {
         let ident = ident.into();
         if self.find_model(ident.clone()).is_err() {
             let mut load = true;
@@ -168,8 +205,8 @@ impl TTSModelHolder {
                 },
                 style_vectors: style::load_style(style_vectors_bytes)?,
                 ident,
-                bytes: if self.max_loaded_models.is_some() {
-                    Some(vits2_bytes.as_ref().to_vec())
+                source: if self.max_loaded_models.is_some() {
+                    Some(source())
                 } else {
                     None
                 },
@@ -254,9 +291,10 @@ impl TTSModelHolder {
 
         // Get bytes to build a Session
         let bytes = self.models[target_index]
-            .bytes
-            .clone()
-            .ok_or(Error::ModelNotFoundError(ident.to_string()))?;
+            .source
+            .as_ref()
+            .ok_or(Error::ModelNotFoundError(ident.to_string()))?
+            .read()?;
 
         // Enforce max loaded models by evicting a different loaded model's session, not removing the entry
         if let Some(max) = self.max_loaded_models {
