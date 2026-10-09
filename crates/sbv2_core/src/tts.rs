@@ -61,6 +61,7 @@ pub struct TTSModelHolder {
     models: Vec<TTSModel>,
     pub jtalk: jtalk::JTalk,
     max_loaded_models: Option<usize>,
+    optimized_dir: Option<PathBuf>,
 }
 
 impl TTSModelHolder {
@@ -85,7 +86,27 @@ impl TTSModelHolder {
             jtalk,
             tokenizer,
             max_loaded_models,
+            optimized_dir: None,
         })
+    }
+
+    /// Write each voice's optimized graph to `dir` and reload evicted voices from it,
+    /// skipping graph optimization. The graph is specific to this machine.
+    pub fn set_optimized_dir<D: Into<PathBuf>>(&mut self, dir: D) {
+        self.optimized_dir = Some(dir.into());
+    }
+
+    fn optimized_path(&self, ident: &TTSIdent) -> Option<PathBuf> {
+        self.optimized_dir
+            .as_ref()
+            .map(|d| d.join(format!("{ident}.onnx")))
+    }
+
+    fn build_vits2(&self, ident: &TTSIdent, vits2_bytes: &[u8]) -> Result<Session> {
+        match self.optimized_path(ident) {
+            Some(p) => model::load_model_saving_optimized(vits2_bytes, false, &p),
+            None => model::load_model(vits2_bytes, false),
+        }
     }
 
     /// Return a list of model names
@@ -134,7 +155,7 @@ impl TTSModelHolder {
                     load = false;
                 }
             }
-            let model = model::load_model(&aivmx_bytes, false)?;
+            let model = self.build_vits2(&ident, aivmx_bytes.as_ref())?;
             let metadata = model.metadata()?;
             if let Some(aivm_style_vectors) = metadata.custom("aivm_style_vectors") {
                 let aivm_style_vectors = BASE64_STANDARD.decode(aivm_style_vectors)?;
@@ -234,7 +255,7 @@ impl TTSModelHolder {
             }
             self.models.push(TTSModel {
                 vits2: if load {
-                    Some(model::load_model(&vits2_bytes, false)?)
+                    Some(self.build_vits2(&ident, vits2_bytes.as_ref())?)
                 } else {
                     None
                 },
@@ -324,12 +345,15 @@ impl TTSModelHolder {
             return Ok(true);
         }
 
-        // Get bytes to build a Session
-        let bytes = self.models[target_index]
-            .source
-            .as_ref()
-            .ok_or(Error::ModelNotFoundError(ident.to_string()))?
-            .read()?;
+        // Get the optimized graph, or bytes to build a Session
+        let input = match self.optimized_path(&ident).filter(|p| p.exists()) {
+            Some(p) => Ok(p),
+            None => Err(self.models[target_index]
+                .source
+                .as_ref()
+                .ok_or(Error::ModelNotFoundError(ident.to_string()))?
+                .read()?),
+        };
 
         // Enforce max loaded models by evicting a different loaded model's session, not removing the entry
         if let Some(max) = self.max_loaded_models {
@@ -347,7 +371,10 @@ impl TTSModelHolder {
         }
 
         // Build and set session in-place for the target model
-        let s = model::load_model(&bytes, false)?;
+        let s = match input {
+            Ok(p) => model::load_optimized_model(&p, false)?,
+            Err(bytes) => self.build_vits2(&ident, &bytes)?,
+        };
         self.models[target_index].vits2 = Some(s);
         Ok(true)
     }

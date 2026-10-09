@@ -187,6 +187,10 @@ impl AppState {
                 .ok()
                 .and_then(|x| x.parse().ok()),
         )?;
+        if let Ok(dir) = env::var("SBV2_OPTIMIZED_DIR") {
+            fs::create_dir_all(&dir).await?;
+            tts_model.set_optimized_dir(dir);
+        }
         let models = env::var("MODELS_PATH").unwrap_or("models".to_string());
         let mut f = fs::read_dir(&models).await?;
         let mut entries = vec![];

@@ -4,11 +4,31 @@ use ort::session::{
     builder::{GraphOptimizationLevel, SessionBuilder},
     Session,
 };
+use std::path::Path;
 
 pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> {
     Ok(session_builder(bert)?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .commit_from_memory(model_file.as_ref())?)
+}
+
+/// Same as `load_model`, also writing the optimized graph to `optimized` for `load_optimized_model`.
+pub fn load_model_saving_optimized<P: AsRef<[u8]>>(
+    model_file: P,
+    bert: bool,
+    optimized: &Path,
+) -> Result<Session> {
+    Ok(session_builder(bert)?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_optimized_model_path(optimized)?
+        .commit_from_memory(model_file.as_ref())?)
+}
+
+/// Load a graph written by `load_model_saving_optimized` without optimizing it again.
+pub fn load_optimized_model(optimized: &Path, bert: bool) -> Result<Session> {
+    Ok(session_builder(bert)?
+        .with_optimization_level(GraphOptimizationLevel::Disable)?
+        .commit_from_file(optimized)?)
 }
 
 #[allow(clippy::vec_init_then_push, unused_variables)]
