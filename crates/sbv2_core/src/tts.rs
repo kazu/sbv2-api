@@ -90,28 +90,22 @@ impl TTSModelHolder {
         })
     }
 
-    /// Write each voice's optimized graph to `dir` and reload evicted voices from it,
-    /// skipping graph optimization. The graph is specific to this machine.
+    /// Write each voice's optimized graph to `dir` (once, in ORT format) and build evicted
+    /// voices from it by mapping the file in place. The graph is specific to this machine.
     pub fn set_optimized_dir<D: Into<PathBuf>>(&mut self, dir: D) {
         self.optimized_dir = Some(dir.into());
     }
 
     fn optimized_path(&self, ident: &TTSIdent) -> Option<PathBuf> {
-        // Experiment: SBV2_ORT_FORMAT=ort caches the ORT format instead of ONNX.
-        let ext = if std::env::var_os("SBV2_ORT_FORMAT").is_some() {
-            "ort"
-        } else {
-            "onnx"
-        };
         self.optimized_dir
             .as_ref()
-            .map(|d| d.join(format!("{ident}.{ext}")))
+            .map(|d| d.join(format!("{ident}.ort")))
     }
 
     fn build_vits2(&self, ident: &TTSIdent, vits2_bytes: &[u8]) -> Result<model::Vits2> {
         match self.optimized_path(ident) {
-            Some(p) if p.exists() => model::load_optimized_model(&p, false),
-            Some(p) => Ok(model::load_model_saving_optimized(vits2_bytes, false, &p)?.into()),
+            Some(p) if p.exists() => model::load_optimized_model(&p),
+            Some(p) => Ok(model::load_model_saving_optimized(vits2_bytes, &p)?.into()),
             None => Ok(model::load_model(vits2_bytes, false)?.into()),
         }
     }
@@ -379,7 +373,7 @@ impl TTSModelHolder {
 
         // Build and set session in-place for the target model
         let s = match input {
-            Ok(p) => model::load_optimized_model(&p, false)?,
+            Ok(p) => model::load_optimized_model(&p)?,
             Err(bytes) => self.build_vits2(&ident, &bytes)?,
         };
         self.models[target_index].vits2 = Some(s);
@@ -431,10 +425,12 @@ impl TTSModelHolder {
     }
 
     /// With `max_loaded_models` of 0, drop the sessions built for a call once it returns.
+    /// The drop runs on its own thread so the caller does not wait for it.
     fn release_unretained(&mut self) {
         if self.max_loaded_models == Some(0) {
-            for m in &mut self.models {
-                m.vits2 = None;
+            let sessions: Vec<_> = self.models.iter_mut().filter_map(|m| m.vits2.take()).collect();
+            if !sessions.is_empty() {
+                std::thread::spawn(move || drop(sessions));
             }
         }
     }

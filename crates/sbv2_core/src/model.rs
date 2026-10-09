@@ -6,7 +6,6 @@ use ort::session::{
     Session,
 };
 use std::path::Path;
-use std::sync::OnceLock;
 
 pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> {
     Ok(session_builder(bert)?
@@ -14,28 +13,18 @@ pub fn load_model<P: AsRef<[u8]>>(model_file: P, bert: bool) -> Result<Session> 
         .commit_from_memory(model_file.as_ref())?)
 }
 
-/// Same as `load_model`, also writing the optimized graph to `optimized` for
-/// `load_optimized_model`: a `.ort` path gets the ORT format, any other path gets ONNX
-/// with its prepacked weights in `<optimized>.data`.
+/// Same as `load_model` for a voice, also writing the optimized graph in ORT format to
+/// `optimized` (a `.ort` path) for `load_optimized_model`. The graph is specific to this
+/// machine. Weights stay unpacked so a later load can use the file in place.
 pub fn load_model_saving_optimized<P: AsRef<[u8]>>(
     model_file: P,
-    bert: bool,
     optimized: &Path,
 ) -> Result<Session> {
-    let mut builder = prepack_knob(session_builder(bert)?)?
+    Ok(session_builder(false)?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_optimized_model_path(optimized)?;
-    if !is_ort_format(optimized) {
-        let mut data = optimized.file_name().unwrap_or_default().to_os_string();
-        data.push(".data");
-        builder = builder
-            .with_config_entry(
-                "session.optimized_model_external_initializers_file_name",
-                data.to_string_lossy(),
-            )?
-            .with_config_entry("session.save_external_prepacked_constant_initializers", "1")?;
-    }
-    Ok(builder.commit_from_memory(model_file.as_ref())?)
+        .with_optimized_model_path(optimized)?
+        .with_config_entry("session.disable_prepacking", "1")?
+        .commit_from_memory(model_file.as_ref())?)
 }
 
 /// A voice session and the mapped file its graph may point into. The field order drops
@@ -67,62 +56,29 @@ impl From<Session> for Vits2 {
     }
 }
 
-/// Load a graph written by `load_model_saving_optimized` without optimizing it again.
-/// A `.ort` file is mapped and used in place instead of being copied.
-pub fn load_optimized_model(optimized: &Path, bert: bool) -> Result<Vits2> {
-    let builder =
-        prepack_knob(session_builder(bert)?)?.with_optimization_level(GraphOptimizationLevel::Disable)?;
-    if is_ort_format(optimized) {
-        // SAFETY: load_model_saving_optimized is the only writer and only writes a path
-        // that does not exist yet.
-        let t0 = std::time::Instant::now();
-        let map = unsafe {
-            memmap2::MmapOptions::new()
-                .populate()
-                .map(&std::fs::File::open(optimized)?)?
-        };
-        let t1 = std::time::Instant::now();
-        let session = builder
-            .with_config_entry("session.use_ort_model_bytes_directly", "1")?
-            .with_config_entry("session.use_ort_model_bytes_for_initializers", "1")?
-            .commit_from_memory(&map)?;
-        log::debug!("timing map={:?} session={:?}", t1 - t0, t1.elapsed());
-        Ok(Vits2 {
-            session,
-            _map: Some(map),
-        })
-    } else {
-        Ok(builder.commit_from_file(optimized)?.into())
-    }
-}
-
-fn is_ort_format(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e == "ort")
-}
-
-/// Experiment: SBV2_ORT_DISABLE_PREPACK leaves weights unpacked.
-fn prepack_knob(builder: SessionBuilder) -> Result<SessionBuilder> {
-    if std::env::var_os("SBV2_ORT_DISABLE_PREPACK").is_some() {
-        Ok(builder.with_config_entry("session.disable_prepacking", "1")?)
-    } else {
-        Ok(builder)
-    }
-}
-
-/// Experiment: SBV2_ORT_GLOBAL_POOL makes every session share one thread pool.
-fn global_pool() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("SBV2_ORT_GLOBAL_POOL").is_some();
-        if on {
-            let n = num_cpus::get_physical();
-            let pool = ort::environment::GlobalThreadPoolOptions::default()
-                .with_intra_threads(n)
-                .and_then(|p| p.with_inter_threads(n))
-                .expect("thread pool options");
-            ort::init().with_global_thread_pool(pool).commit();
-        }
-        on
+/// Load a voice graph written by `load_model_saving_optimized`. The file is mapped and
+/// used in place: no graph optimization, prepacking or copy of the weights, so the only
+/// memory the session owns is its working set.
+pub fn load_optimized_model(optimized: &Path) -> Result<Vits2> {
+    // SAFETY: load_model_saving_optimized is the only writer and only writes a path
+    // that does not exist yet.
+    let t0 = std::time::Instant::now();
+    let map = unsafe {
+        memmap2::MmapOptions::new()
+            .populate()
+            .map(&std::fs::File::open(optimized)?)?
+    };
+    let t1 = std::time::Instant::now();
+    let session = session_builder(false)?
+        .with_optimization_level(GraphOptimizationLevel::Disable)?
+        .with_config_entry("session.disable_prepacking", "1")?
+        .with_config_entry("session.use_ort_model_bytes_directly", "1")?
+        .with_config_entry("session.use_ort_model_bytes_for_initializers", "1")?
+        .commit_from_memory(&map)?;
+    log::debug!("timing map={:?} session={:?}", t1 - t0, t1.elapsed());
+    Ok(Vits2 {
+        session,
+        _map: Some(map),
     })
 }
 
@@ -161,14 +117,10 @@ fn session_builder(bert: bool) -> Result<SessionBuilder> {
         exp.push(ort::execution_providers::CoreMLExecutionProvider::default().build());
     }
     exp.push(ort::execution_providers::CPUExecutionProvider::default().build());
-    let builder = Session::builder()?
+    Ok(Session::builder()?
         .with_execution_providers(exp)?
-        .with_parallel_execution(true)?;
-    if global_pool() {
-        return Ok(builder);
-    }
-    Ok(builder
         .with_intra_threads(num_cpus::get_physical())?
+        .with_parallel_execution(true)?
         .with_inter_threads(num_cpus::get_physical())?)
 }
 
