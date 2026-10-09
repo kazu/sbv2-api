@@ -408,8 +408,19 @@ impl TTSModelHolder {
         speaker_id: i64,
         options: SynthesizeOptions,
     ) -> Result<Vec<u8>> {
-        let result = self.easy_synthesize_loaded(ident, text, style_id, speaker_id, options);
+        let t0 = std::time::Instant::now();
+        let loaded = self.find_and_load_model(ident);
+        let t1 = std::time::Instant::now();
+        let result = loaded
+            .and_then(|_| self.easy_synthesize_loaded(ident, text, style_id, speaker_id, options));
+        let t2 = std::time::Instant::now();
         self.release_unretained();
+        log::debug!(
+            "timing load={:?} synth={:?} release={:?}",
+            t1 - t0,
+            t2 - t1,
+            t2.elapsed()
+        );
         result
     }
 
